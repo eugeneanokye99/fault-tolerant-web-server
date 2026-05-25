@@ -60,22 +60,12 @@ Parameters:
     MaxValue: 90
     Description: Average CPU % that triggers a scale-IN event.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MAPPINGS
-# ──────────────────────────────────────────────────────────────────────────────
-Mappings:
-  # Latest Amazon Linux 2 AMI per region (update as needed)
-  AmazonLinux2AMI:
-    us-east-1:      { AMI: ami-0c02fb55956c7d316 }
-    us-east-2:      { AMI: ami-0b0dcb5067f052a63 }
-    us-west-1:      { AMI: ami-0d9858aa3c6322f73 }
-    us-west-2:      { AMI: ami-098e42ae54c764c35 }
-    eu-west-1:      { AMI: ami-0d71ea30463e0ff49 }
-    eu-west-2:      { AMI: ami-0904d8f60d46b9aef }
-    eu-central-1:   { AMI: ami-0d527b8c289b4af7f }
-    ap-southeast-1: { AMI: ami-0c802847a7dd848c0 }
-    ap-southeast-2: { AMI: ami-07620139298af599e }
-    ap-northeast-1: { AMI: ami-0218d08a1f9dac831 }
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: >
+      SSM path to the latest Amazon Linux 2 AMI. Resolved automatically
+      per region at deploy time — no hardcoded AMI IDs needed.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RESOURCES
@@ -264,7 +254,7 @@ Resources:
     Properties:
       LaunchTemplateName: !Sub "${AWS::StackName}-launch-template"
       LaunchTemplateData:
-        ImageId: !FindInMap [AmazonLinux2AMI, !Ref "AWS::Region", AMI]
+        ImageId: !Ref LatestAmiId
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyPairName
         IamInstanceProfile:
