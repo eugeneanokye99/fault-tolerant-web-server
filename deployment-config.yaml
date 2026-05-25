@@ -3,7 +3,7 @@
 
 template-file-path: ./fault-tolerant-web-app.yaml
 
-stack-name: fault-tolerant-web-app
+stack-name: fault-tolerant-web-stack
 
 region: eu-central-1
 
@@ -14,6 +14,6 @@ parameters:
   KeyPairName: my-key-pair
 
 tags:
-  Project: fault-tolerant-web-app
+  Project: fault-tolerant-web-stack
   Environment: demo
   ManagedBy: CloudFormation-GitSync
