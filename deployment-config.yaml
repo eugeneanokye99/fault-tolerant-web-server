@@ -9,7 +9,9 @@ region: eu-central-1
 
 parameters:
   LatestAmiId: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
-
+  VpcId: vpc-xxxxxxxx
+  PublicSubnetIds: subnet-aaaaaaaa,subnet-bbbbbbbb
+  KeyPairName: my-key-pair
 
 tags:
   Project: fault-tolerant-web-stack
