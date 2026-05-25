@@ -1,0 +1,3 @@
+template-file-path: fault-tolerant-web-app.yaml
+parameters: {}
+tags: {}
