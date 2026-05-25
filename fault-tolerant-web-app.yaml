@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Fault-tolerant marketing website — EC2 Launch Template + Application
+  Load Balancer + Auto Scaling Group. Instances serve "Hello World from
+  [Hostname]" via Apache. ASG scales on CPU utilisation.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where all resources will be created.
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two public subnets in different AZs (for ALB and ASG).
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t2.micro, t2.small]
+    Description: EC2 instance type for web servers.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access (optional but recommended).
+
+  AsgMinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of instances in the ASG.
+
+  AsgMaxSize:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    Description: Maximum number of instances the ASG can scale to.
+
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Initial desired number of running instances.
+
+  CpuScaleOutThreshold:
+    Type: Number
+    Default: 70
+    MinValue: 10
+    MaxValue: 95
+    Description: Average CPU % that triggers a scale-OUT event.
+
+  CpuScaleInThreshold:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 90
+    Description: Average CPU % that triggers a scale-IN event.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAPPINGS
+# ──────────────────────────────────────────────────────────────────────────────
+Mappings:
+  # Latest Amazon Linux 2 AMI per region (update as needed)
+  AmazonLinux2AMI:
+    us-east-1:      { AMI: ami-0c02fb55956c7d316 }
+    us-east-2:      { AMI: ami-0b0dcb5067f052a63 }
+    us-west-1:      { AMI: ami-0d9858aa3c6322f73 }
+    us-west-2:      { AMI: ami-098e42ae54c764c35 }
+    eu-west-1:      { AMI: ami-0d71ea30463e0ff49 }
+    eu-west-2:      { AMI: ami-0904d8f60d46b9aef }
+    eu-central-1:   { AMI: ami-0d527b8c289b4af7f }
+    ap-southeast-1: { AMI: ami-0c802847a7dd848c0 }
+    ap-southeast-2: { AMI: ami-07620139298af599e }
+    ap-northeast-1: { AMI: ami-0218d08a1f9dac831 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Security Groups ──────────────────────────────────────────────────────────
+
+  # ALB: accept HTTP from anywhere
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP inbound to the ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  # EC2: accept HTTP only from the ALB SG; accept SSH from anywhere (tighten in prod)
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH for management
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB only
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH (restrict to your IP in production)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-web-sg"
+
+  # ── IAM Role (SSM access so you can connect without SSH if needed) ───────────
+
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-web-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-web-server-inline"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # ── CloudWatch: push custom metrics from the instance ───────────
+              - Sid: CloudWatchMetricsAndLogs
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:DescribeAlarms
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: AWS/EC2
+
+              # ── CloudWatch Logs: write Apache/app logs ──────────────────────
+              - Sid: CloudWatchLogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ec2/${AWS::StackName}*"
+
+              # ── EC2: describe self (hostname, tags, AZ metadata) ────────────
+              - Sid: EC2DescribeSelf
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+
+              # ── Auto Scaling: read-only (describe group/instance state) ─────
+              - Sid: AutoScalingDescribe
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeLifecycleHooks
+                  - autoscaling:DescribeScalingActivities
+                Resource: "*"
+
+              # ── Auto Scaling: complete lifecycle hooks on this ASG only ─────
+              - Sid: AutoScalingLifecycleHookComplete
+                Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:RecordLifecycleActionHeartbeat
+                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-asg"
+
+              # ── ELB: describe target health (useful for boot-time checks) ───
+              - Sid: ElasticLoadBalancingDescribe
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeLoadBalancers
+                Resource: "*"
+
+              # ── CloudFormation: cfn-signal back to the stack ────────────────
+              - Sid: CloudFormationSignal
+                Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStacks
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+
+              # ── SSM Parameter Store: read stack-scoped config only ──────────
+              - Sid: SSMParameterRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*"
+
+              # ── Explicit deny: protect infrastructure from rogue code ───────
+              - Sid: DenyDangerousActions
+                Effect: Deny
+                Action:
+                  - iam:CreateUser
+                  - iam:DeleteUser
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - ec2:TerminateInstances
+                  - autoscaling:DeleteAutoScalingGroup
+                  - autoscaling:UpdateAutoScalingGroup
+                  - elasticloadbalancing:DeleteLoadBalancer
+                  - cloudformation:DeleteStack
+                Resource: "*"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-web-role"
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-web-profile"
+      Roles:
+        - !Ref WebServerRole
+
+  # ── EC2 Launch Template ──────────────────────────────────────────────────────
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-launch-template"
+      LaunchTemplateData:
+        ImageId: !FindInMap [AmazonLinux2AMI, !Ref "AWS::Region", AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref WebServerInstanceProfile
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        Monitoring:
+          Enabled: true          # detailed CloudWatch metrics (1-min granularity)
+        MetadataOptions:
+          HttpTokens: required   # enforce IMDSv2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            # ── System updates ──────────────────────────────────────────────
+            yum update -y
+
+            # ── Install Apache ──────────────────────────────────────────────
+            yum install -y httpd
+
+            # ── Enable & start Apache ───────────────────────────────────────
+            systemctl enable httpd
+            systemctl start httpd
+
+            # ── Custom index page ───────────────────────────────────────────
+            HOSTNAME=$(hostname -f)
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            REGION=${AWS::Region}
+
+            cat > /var/www/html/index.html <<EOF
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <title>Hello World</title>
+              <style>
+                body { font-family: Arial, sans-serif; max-width: 600px;
+                       margin: 80px auto; text-align: center; color: #333; }
+                h1   { font-size: 2.5rem; color: #1a73e8; }
+                .info{ background: #f1f3f4; border-radius: 8px;
+                       padding: 20px; margin-top: 24px; text-align: left; }
+                .info p { margin: 6px 0; font-size: 0.95rem; }
+                .label { font-weight: bold; color: #555; }
+              </style>
+            </head>
+            <body>
+              <h1>Hello World!</h1>
+              <p>This page is served by a fault-tolerant Auto Scaling Group.</p>
+              <div class="info">
+                <p><span class="label">Hostname:</span> $HOSTNAME</p>
+                <p><span class="label">Instance ID:</span> $INSTANCE_ID</p>
+                <p><span class="label">Availability Zone:</span> $AZ</p>
+                <p><span class="label">Region:</span> $REGION</p>
+                <p><span class="label">Stack:</span> ${AWS::StackName}</p>
+              </div>
+            </body>
+            </html>
+            EOF
+
+            # ── Health-check endpoint (ALB uses GET / on port 80) ───────────
+            # Default index.html above is sufficient; Apache returns HTTP 200.
+
+            # ── Signal CloudFormation that bootstrap succeeded ───────────────
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack  ${AWS::StackName} \
+              --region ${AWS::Region} \
+              --resource AutoScalingGroup
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${AWS::StackName}-web-server"
+              - Key: Project
+                Value: FaultTolerantWebApp
+
+  # ── Application Load Balancer ────────────────────────────────────────────────
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+
+  # Target Group — ALB forwards traffic here; ASG registers instances automatically
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-tg"
+
+  # Listener — port 80 → forward to target group
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  # ── Auto Scaling Group ───────────────────────────────────────────────────────
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: AlbListener
+    CreationPolicy:                        # wait for cfn-signal from instances
+      ResourceSignal:
+        Count: !Ref AsgDesiredCapacity
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        WaitOnResourceSignals: true
+        PauseTime: PT5M
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      VPCZoneIdentifier: !Ref PublicSubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      TargetGroupARNs:
+        - !Ref AlbTargetGroup
+      HealthCheckType: ELB               # use ALB health checks, not EC2 status
+      HealthCheckGracePeriod: 120
+      MetricsCollection:
+        - Granularity: "1Minute"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-web-server"
+          PropagateAtLaunch: true
+
+  # ── Scaling Policies (Step Scaling on CPU) ───────────────────────────────────
+
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: 20
+          ScalingAdjustment: 1     # CPU 70-90 % → add 1
+        - MetricIntervalLowerBound: 20
+          ScalingAdjustment: 2     # CPU > 90 % → add 2
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      StepAdjustments:
+        - MetricIntervalUpperBound: 0
+          ScalingAdjustment: -1    # CPU < 30 % → remove 1
+
+  # ── CloudWatch Alarms ────────────────────────────────────────────────────────
+
+  CpuHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cpu-high"
+      AlarmDescription: Scale out when average CPU exceeds threshold
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Average
+      Period: 120           # evaluate over 2 minutes
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuScaleOutThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+      TreatMissingData: notBreaching
+
+  CpuLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cpu-low"
+      AlarmDescription: Scale in when average CPU drops below threshold
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Average
+      Period: 300           # evaluate over 5 minutes
+      EvaluationPeriods: 3
+      Threshold: !Ref CpuScaleInThreshold
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ScaleInPolicy
+      TreatMissingData: notBreaching
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  LoadBalancerDNS:
+    Description: >
+      Open this URL in your browser to see "Hello World from [Hostname]".
+      Refresh repeatedly to watch different instances respond.
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-alb-dns"
+
+  LoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub "${AWS::StackName}-alb-arn"
+
+  TargetGroupArn:
+    Description: ARN of the ALB Target Group
+    Value: !Ref AlbTargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-tg-arn"
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-asg-name"
+
+  LaunchTemplateId:
+    Description: ID of the EC2 Launch Template
+    Value: !Ref WebServerLaunchTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-lt-id"
+
+  DeployCommand:
+    Description: AWS CLI command to deploy this stack
+    Value: !Sub >
+      aws cloudformation deploy
+      --template-file fault-tolerant-web-app.yaml
+      --stack-name my-web-app
+      --capabilities CAPABILITY_NAMED_IAM
+      --parameter-overrides
+        VpcId=<your-vpc-id>
+        PublicSubnetIds=<subnet-1>,<subnet-2>
+        KeyPairName=<your-key-pair>
